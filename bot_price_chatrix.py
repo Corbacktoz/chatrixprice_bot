@@ -1,5 +1,8 @@
 import os
 import math
+import time
+import random
+import asyncio
 import logging
 from typing import Optional, Tuple
 
@@ -14,12 +17,17 @@ from telegram.ext import (
 
 # -------------------- CONFIG --------------------
 UPDATE_INTERVAL_SECONDS = 600  # 10 minutes
+MIN_REFRESH_SECONDS = 60       # cache 60s pour éviter 429 si /now spam
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 
 # Contrat par défaut (CHATRIX sur BSC) ; modifiable via env TOKEN_ADDRESS
 DEFAULT_CONTRACT = "0xAf62c16e46238c14AB8eda78285feb724e7d4444"
 CONTRACT_ADDRESS = os.getenv("TOKEN_ADDRESS", DEFAULT_CONTRACT).strip()
 PREFERRED_CHAIN = os.getenv("PREFERRED_CHAIN", "bsc").strip().lower()
+
+# Cache simple en mémoire
+_last_msg = None
+_last_ts = 0.0
 
 # -------------------- LOGGING --------------------
 logger = logging.getLogger("chatrix-bot")
@@ -59,25 +67,46 @@ def _safe_float(d, *path) -> Optional[float]:
 # -------------------- DATA FETCH --------------------
 async def fetch_best_pair(session: aiohttp.ClientSession, address: str, preferred_chain: str = "bsc") -> Optional[dict]:
     url = DEXSCREENER_TOKEN_URL.format(address=address)
-    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as r:
-        if r.status != 200:
+    timeout = aiohttp.ClientTimeout(total=20)
+    headers = {"User-Agent": "chatrix-price-bot/1.0"}
+    backoff = 1.0
+
+    for attempt in range(5):  # jusqu'à 5 tentatives
+        async with session.get(url, timeout=timeout, headers=headers) as r:
+            if r.status == 200:
+                data = await r.json()
+                pairs = data.get("pairs", []) or []
+                if not pairs:
+                    return None
+
+                same_chain = [p for p in pairs if (p.get("chainId", "") or "").lower() == preferred_chain.lower()]
+                candidates = same_chain if same_chain else pairs
+
+                def score(p):
+                    liq = _safe_float(p, "liquidity", "usd") or 0.0
+                    vol = _safe_float(p, "volume", "h24") or 0.0
+                    return (liq, vol)
+
+                return max(candidates, key=score)
+
+            if r.status == 429:
+                ra = r.headers.get("Retry-After")
+                sleep_s = float(ra) if ra and ra.isdigit() else backoff + random.uniform(0, 0.5)
+                logger.warning("Dexscreener 429. Retry in %.2fs (attempt %s/5)", sleep_s, attempt + 1)
+                await asyncio.sleep(sleep_s)
+                backoff *= 2
+                continue
+
+            if 500 <= r.status < 600:
+                sleep_s = backoff + random.uniform(0, 0.5)
+                logger.warning("Dexscreener %s. Retry in %.2fs (attempt %s/5)", r.status, sleep_s, attempt + 1)
+                await asyncio.sleep(sleep_s)
+                backoff *= 2
+                continue
+
             raise RuntimeError(f"Dexscreener HTTP {r.status}")
-        data = await r.json()
 
-    pairs = data.get("pairs", []) or []
-    if not pairs:
-        return None
-
-    same_chain = [p for p in pairs if (p.get("chainId", "") or "").lower() == preferred_chain.lower()]
-    candidates = same_chain if same_chain else pairs
-
-    def score(p):
-        liq = _safe_float(p, "liquidity", "usd") or 0.0
-        vol = _safe_float(p, "volume", "h24") or 0.0
-        return (liq, vol)
-
-    best = max(candidates, key=score)
-    return best
+    raise RuntimeError("Dexscreener rate limited (429) after retries")
 
 def extract_metrics(best: dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], str]:
     """
@@ -106,12 +135,22 @@ def build_message(price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, u
     return "\n".join(lines)
 
 async def compose_message() -> str:
+    """Produit le message, avec cache 60s pour éviter le spam."""
+    global _last_msg, _last_ts
+    now = time.time()
+    if _last_msg and (now - _last_ts) < MIN_REFRESH_SECONDS:
+        return _last_msg
+
     async with aiohttp.ClientSession() as session:
         best = await fetch_best_pair(session, CONTRACT_ADDRESS, PREFERRED_CHAIN)
         if not best:
-            return "Impossible de récupérer les données pour ce token pour le moment."
-        price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url = extract_metrics(best)
-        return build_message(price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url)
+            msg = "Impossible de récupérer les données pour ce token pour le moment."
+        else:
+            price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url = extract_metrics(best)
+            msg = build_message(price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url)
+
+        _last_msg, _last_ts = msg, now
+        return msg
 
 # -------------------- JOB + COMMANDS --------------------
 async def send_update(context: ContextTypes.DEFAULT_TYPE):
@@ -177,9 +216,7 @@ def main():
     )
 
     logger.info("Bot started. Sending price updates every %s seconds.", UPDATE_INTERVAL_SECONDS)
-
-    # IMPORTANT: ne pas appeler depuis asyncio.run ; PTB gère la boucle
-    application.run_polling()  # blocant
+    application.run_polling()  # PTB gère la boucle asyncio
 
 if __name__ == "__main__":
     main()
