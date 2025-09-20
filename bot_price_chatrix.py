@@ -1,6 +1,5 @@
 import os
 import math
-import asyncio
 import logging
 from typing import Optional, Tuple
 
@@ -17,7 +16,7 @@ from telegram.ext import (
 UPDATE_INTERVAL_SECONDS = 600  # 10 minutes
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 
-# Par défaut on met le contrat CHATRIX (BSC) ; tu peux le changer via env var TOKEN_ADDRESS
+# Contrat par défaut (CHATRIX sur BSC) ; modifiable via env TOKEN_ADDRESS
 DEFAULT_CONTRACT = "0xAf62c16e46238c14AB8eda78285feb724e7d4444"
 CONTRACT_ADDRESS = os.getenv("TOKEN_ADDRESS", DEFAULT_CONTRACT).strip()
 PREFERRED_CHAIN = os.getenv("PREFERRED_CHAIN", "bsc").strip().lower()
@@ -38,7 +37,6 @@ def _fmt_num(n: Optional[float]) -> str:
         n = float(n)
     except Exception:
         return "?"
-    # suffixes
     absn = abs(n)
     if absn >= 1_000_000_000:
         return f"{n/1_000_000_000:.2f}B"
@@ -46,7 +44,6 @@ def _fmt_num(n: Optional[float]) -> str:
         return f"{n/1_000_000:.2f}M"
     if absn >= 1_000:
         return f"{n/1_000:.2f}K"
-    # petit nombre
     if absn < 1:
         return f"{n:.8f}".rstrip("0").rstrip(".")
     return f"{n:.2f}"
@@ -71,11 +68,9 @@ async def fetch_best_pair(session: aiohttp.ClientSession, address: str, preferre
     if not pairs:
         return None
 
-    # filtre par chain préférée si dispo
     same_chain = [p for p in pairs if (p.get("chainId", "") or "").lower() == preferred_chain.lower()]
     candidates = same_chain if same_chain else pairs
 
-    # choisir la pair avec la meilleure liquidité (fallback volume 24h)
     def score(p):
         liq = _safe_float(p, "liquidity", "usd") or 0.0
         vol = _safe_float(p, "volume", "h24") or 0.0
@@ -134,7 +129,6 @@ async def send_update(context: ContextTypes.DEFAULT_TYPE):
         logger.error("❌ Error while sending update: %s", e)
 
 async def cmd_now(update, context):
-    """Envoi immédiat dans le chat courant."""
     try:
         msg = await compose_message()
         await update.effective_message.reply_html(msg, disable_web_page_preview=False)
@@ -153,8 +147,8 @@ async def cmd_start(update, _context):
         "• /id pour afficher le chat_id"
     )
 
-# -------------------- MAIN --------------------
-async def main():
+# -------------------- MAIN (synchronE) --------------------
+def main():
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -173,7 +167,7 @@ async def main():
     application.add_handler(CommandHandler("now", cmd_now))
     application.add_handler(CommandHandler("id", cmd_id))
 
-    # planification
+    # planification (JobQueue)
     application.job_queue.run_repeating(
         send_update,
         interval=UPDATE_INTERVAL_SECONDS,
@@ -183,7 +177,9 @@ async def main():
     )
 
     logger.info("Bot started. Sending price updates every %s seconds.", UPDATE_INTERVAL_SECONDS)
-    await application.run_polling(allowed_updates=None)
+
+    # IMPORTANT: ne pas appeler depuis asyncio.run ; PTB gère la boucle
+    application.run_polling()  # blocant
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
