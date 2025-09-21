@@ -16,14 +16,21 @@ from telegram.ext import (
 )
 
 # -------------------- CONFIG --------------------
-UPDATE_INTERVAL_SECONDS = 600  # 10 minutes
-MIN_REFRESH_SECONDS = 60       # cache 60s pour éviter 429 si /now spam
+UPDATE_INTERVAL_SECONDS = 1800  # 30 minutes
+MIN_REFRESH_SECONDS = 60        # cache 60s pour éviter 429 si /now spam
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 
 # Contrat par défaut (CHATRIX sur BSC) ; modifiable via env TOKEN_ADDRESS
 DEFAULT_CONTRACT = "0xAf62c16e46238c14AB8eda78285feb724e7d4444"
 CONTRACT_ADDRESS = os.getenv("TOKEN_ADDRESS", DEFAULT_CONTRACT).strip()
 PREFERRED_CHAIN = os.getenv("PREFERRED_CHAIN", "bsc").strip().lower()
+
+# Montant détenu (modifiable via env HOLDINGS_AMOUNT)
+DEFAULT_HOLDINGS = "3239008"
+try:
+    HOLDINGS_AMOUNT = float(os.getenv("HOLDINGS_AMOUNT", DEFAULT_HOLDINGS))
+except Exception:
+    HOLDINGS_AMOUNT = 3239008.0
 
 # Cache simple en mémoire
 _last_msg = None
@@ -54,7 +61,13 @@ def _fmt_num(n: Optional[float]) -> str:
         return f"{n/1_000:.2f}K"
     if absn < 1:
         return f"{n:.8f}".rstrip("0").rstrip(".")
-    return f"{n:.2f}"
+    return f"{n:.4f}" if n < 10 else f"{n:.2f}"
+
+def _fmt_int(n: float) -> str:
+    try:
+        return f"{int(n):,}".replace(",", " ")
+    except Exception:
+        return str(n)
 
 def _safe_float(d, *path) -> Optional[float]:
     try:
@@ -68,7 +81,7 @@ def _safe_float(d, *path) -> Optional[float]:
 async def fetch_best_pair(session: aiohttp.ClientSession, address: str, preferred_chain: str = "bsc") -> Optional[dict]:
     url = DEXSCREENER_TOKEN_URL.format(address=address)
     timeout = aiohttp.ClientTimeout(total=20)
-    headers = {"User-Agent": "chatrix-price-bot/1.0"}
+    headers = {"User-Agent": "chatrix-price-bot/1.1"}
     backoff = 1.0
 
     for attempt in range(5):  # jusqu'à 5 tentatives
@@ -108,27 +121,32 @@ async def fetch_best_pair(session: aiohttp.ClientSession, address: str, preferre
 
     raise RuntimeError("Dexscreener rate limited (429) after retries")
 
-def extract_metrics(best: dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], str]:
+def extract_metrics(best: dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], str]:
     """
-    Retourne: price_usd, change_24h_pct, marketcap_usd, fdv_usd, volume_24h, liquidity_usd, url
+    Retourne: price_usd, change_24h_pct, marketcap_usd, fdv_usd, url
+    (volume supprimé)
     """
     url = best.get("url") or ""
     price_usd = _safe_float(best, "priceUsd")
     change_24h = _safe_float(best, "priceChange", "h24")
     mcap = _safe_float(best, "marketCap")
     fdv = _safe_float(best, "fdv")
-    volume_24h = _safe_float(best, "volume", "h24")
-    liquidity_usd = _safe_float(best, "liquidity", "usd")
-    return price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url
+    return price_usd, change_24h, mcap, fdv, url
 
-def build_message(price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url: str) -> str:
+def build_message(price_usd, change_24h, mcap, fdv, url: str, holdings: float) -> str:
     chg = f"{change_24h:+.2f}%" if change_24h is not None else "?"
+    # Valeur du portefeuille
+    if price_usd is not None:
+        holdings_value = holdings * price_usd
+        holdings_line = f"👛 Tes tokens: <b>{_fmt_int(holdings)}</b>  →  Valeur: <b>${_fmt_num(holdings_value)}</b>"
+    else:
+        holdings_line = f"👛 Tes tokens: <b>{_fmt_int(holdings)}</b>  →  Valeur: <b>?</b>"
+
     lines = [
         "<b>CHATRIX (BSC)</b>",
         f"💵 Prix: <b>${_fmt_num(price_usd)}</b>  |  24h: <b>{chg}</b>",
         f"💰 Market Cap: <b>${_fmt_num(mcap) if mcap is not None else (_fmt_num(fdv) if fdv is not None else '?')}</b>",
-        f"📊 Volume 24h: <b>${_fmt_num(volume_24h)}</b>",
-        f"💦 Liquidité: <b>${_fmt_num(liquidity_usd)}</b>",
+        holdings_line,
     ]
     if url:
         lines.append(f"🔗 <a href='{url}'>Voir sur Dexscreener</a>")
@@ -146,8 +164,8 @@ async def compose_message() -> str:
         if not best:
             msg = "Impossible de récupérer les données pour ce token pour le moment."
         else:
-            price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url = extract_metrics(best)
-            msg = build_message(price_usd, change_24h, mcap, fdv, volume_24h, liquidity_usd, url)
+            price_usd, change_24h, mcap, fdv, url = extract_metrics(best)
+            msg = build_message(price_usd, change_24h, mcap, fdv, url, HOLDINGS_AMOUNT)
 
         _last_msg, _last_ts = msg, now
         return msg
@@ -181,7 +199,7 @@ async def cmd_id(update, _context):
 
 async def cmd_start(update, _context):
     await update.message.reply_text(
-        "Hello 👋 Je t’enverrai le prix & la marketcap toutes les 10 minutes.\n"
+        "Hello 👋 Je t’enverrai le prix & la marketcap toutes les 30 minutes.\n"
         "• /now pour un envoi immédiat\n"
         "• /id pour afficher le chat_id"
     )
@@ -206,7 +224,7 @@ def main():
     application.add_handler(CommandHandler("now", cmd_now))
     application.add_handler(CommandHandler("id", cmd_id))
 
-    # planification (JobQueue)
+    # planification (JobQueue) — 30 minutes
     application.job_queue.run_repeating(
         send_update,
         interval=UPDATE_INTERVAL_SECONDS,
