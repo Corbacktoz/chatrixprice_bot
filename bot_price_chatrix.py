@@ -208,8 +208,9 @@ async def cmd_now(update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Erreur: {e}")
 
 async def main():
-    token = os.getenv("TELEGRAM_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+	token = os.getenv("TELEGRAM_BOT_TOKEN")
+	chat_id = os.getenv("TELEGRAM_CHAT_ID")
+
     if not token or not chat_id:
         raise RuntimeError("TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant")
 
