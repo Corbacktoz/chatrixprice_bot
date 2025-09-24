@@ -12,7 +12,7 @@ from telegram.ext import Application, AIORateLimiter, CommandHandler, ContextTyp
 
 # -------------------- PARAMS --------------------
 UPDATE_INTERVAL_SECONDS = 1800  # 30 minutes
-MIN_REFRESH_SECONDS = 60        # cache 60s anti-spam
+MIN_REFRESH_SECONDS = 60        # cache anti-spam
 DEXSCREENER_TOKEN_URL = "https://api.dexscreener.com/latest/dex/tokens/{address}"
 PREFERRED_CHAIN = os.getenv("PREFERRED_CHAIN", "bsc").strip().lower()
 
@@ -35,7 +35,7 @@ TOKENS = [
 ]
 
 # cache par token
-_cache: Dict[str, Dict[str, Any]] = {}  # {address: {"ts": float, "msg": str, "price": float}}
+_cache: Dict[str, Dict[str, Any]] = {}
 
 # -------------------- LOGGING --------------------
 logger = logging.getLogger("chatrix-bot")
@@ -46,7 +46,7 @@ logger.setLevel(logging.INFO)
 
 # -------------------- UTILS --------------------
 def _fmt_num(n: Optional[float]) -> str:
-    if n is None or (isinstance(n, float) and (math.isnan(n) or math.isinf(n))):
+    if n is None:
         return "?"
     try:
         n = float(n)
@@ -105,7 +105,7 @@ async def fetch_best_pair(session: aiohttp.ClientSession, address: str, preferre
             if r.status == 429:
                 ra = r.headers.get("Retry-After")
                 sleep_s = float(ra) if ra and ra.isdigit() else backoff + random.uniform(0, 0.5)
-                logger.warning("Dexscreener 429 (%s). Retry in %.2fs (try %s/5)", address, sleep_s, attempt + 1)
+                logger.warning("Dexscreener 429 for %s. Retry in %.2fs (try %s/5)", address, sleep_s, attempt + 1)
                 await asyncio.sleep(sleep_s)
                 backoff *= 2
                 continue
@@ -122,14 +122,12 @@ async def fetch_best_pair(session: aiohttp.ClientSession, address: str, preferre
     raise RuntimeError(f"Dexscreener rate limited for {address}")
 
 def extract_metrics(best: dict) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], str, str]:
-    """price_usd, change_24h_pct, marketcap_usd, fdv_usd, url, pretty_name"""
     url = best.get("url") or ""
     price_usd = _safe_float(best, "priceUsd")
     change_24h = _safe_float(best, "priceChange", "h24")
     mcap = _safe_float(best, "marketCap")
     fdv = _safe_float(best, "fdv")
 
-    # Joli nom si dispo
     base_sym = (best.get("baseToken", {}) or {}).get("symbol") or ""
     quote_sym = (best.get("quoteToken", {}) or {}).get("symbol") or ""
     chain = (best.get("chainId") or "").upper()
@@ -160,7 +158,6 @@ def build_token_section(label: str, price_usd, change_24h, mcap, fdv, url: str, 
     return "\n".join(lines), value
 
 async def compose_message() -> str:
-    # petit cache global par token pour 60s
     now = time.time()
     async with aiohttp.ClientSession() as session:
         sections = []
@@ -171,7 +168,6 @@ async def compose_message() -> str:
             label = t["label"]
             holdings = float(t["holdings"])
 
-            # cache
             c = _cache.get(addr)
             if c and (now - c.get("ts", 0)) < MIN_REFRESH_SECONDS:
                 sections.append(c["msg"])
@@ -184,7 +180,6 @@ async def compose_message() -> str:
                 value = 0.0
             else:
                 price_usd, change_24h, mcap, fdv, url, pretty_name = extract_metrics(best)
-                # Si Dex nous donne un vrai nom, on remplace le label
                 shown_label = pretty_name if pretty_name.lower() != "token" else label
                 msg, value = build_token_section(shown_label, price_usd, change_24h, mcap, fdv, url, holdings)
 
@@ -202,4 +197,30 @@ async def send_update(context: ContextTypes.DEFAULT_TYPE):
         msg = await compose_message()
         await context.bot.send_message(chat_id=chat_id, text=msg, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
         logger.info("✅ Sent price update to chat %s", chat_id)
-   
+    except Exception as e:
+        logger.error("❌ Error in send_update: %s", e)
+
+async def cmd_now(update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        msg = await compose_message()
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, disable_web_page_preview=False)
+    except Exception as e:
+        await update.message.reply_text(f"Erreur: {e}")
+
+async def main():
+    token = os.getenv("TELEGRAM_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        raise RuntimeError("TELEGRAM_TOKEN ou TELEGRAM_CHAT_ID manquant")
+
+    app = Application.builder().token(token).rate_limiter(AIORateLimiter()).build()
+
+    app.add_handler(CommandHandler("now", cmd_now))
+
+    app.job_queue.run_repeating(send_update, interval=UPDATE_INTERVAL_SECONDS, first=5, data={"chat_id": chat_id})
+
+    logger.info("Bot started. Sending price updates every %s seconds.", UPDATE_INTERVAL_SECONDS)
+    await app.run_polling()
+
+if __name__ == "__main__":
+    asyncio.run(main())
