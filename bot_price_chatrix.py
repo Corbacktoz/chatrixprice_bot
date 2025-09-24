@@ -1,6 +1,6 @@
 import os
-import asyncio
 import logging
+import asyncio
 from datetime import timedelta
 from typing import List, Optional, Tuple
 
@@ -23,15 +23,16 @@ log = logging.getLogger("chatrix-bot")
 
 DEX_API = "https://api.dexscreener.com/latest/dex/tokens/{}"
 
-# ---- Tokens à suivre ----
+# ---- Tokens à suivre (adresses en dur) ----
 TOKEN_T1_ADDR = "0xAf62c16e46238c14AB8eda78285feb724e7d4444"  # Chatrix
 TOKEN_T2_ADDR = "0x9f6c24232f1Bba6ef47BCb81b9b9434aCDB94444"
 TOKEN_T3_ADDR = "0xe939C153e56136691Dca84fC92E8fFBb46854444"
 
+# Holdings lus depuis les variables d'env Railway
 TOKENS: List[Tuple[str, str, str]] = [
     ("Chatrix", TOKEN_T1_ADDR, os.getenv("HOLDINGS_AMOUNT", "0").strip()),
-    ("T2", TOKEN_T2_ADDR, os.getenv("HOLDINGS_T2", "0").strip()),
-    ("T3", TOKEN_T3_ADDR, os.getenv("HOLDINGS_T3", "0").strip()),
+    ("T2",      TOKEN_T2_ADDR, os.getenv("HOLDINGS_T2", "0").strip()),
+    ("T3",      TOKEN_T3_ADDR, os.getenv("HOLDINGS_T3", "0").strip()),
 ]
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -58,6 +59,10 @@ def _fmt_usd(v: float) -> str:
 
 
 async def fetch_price_usd(session: aiohttp.ClientSession, token_addr: str) -> Optional[float]:
+    """
+    Récupère le prix USD via Dexscreener.
+    Retourne None si non trouvé. Gère les 429/erreurs avec backoff.
+    """
     url = DEX_API.format(token_addr)
     backoff = 2.0
     for attempt in range(6):
@@ -79,16 +84,20 @@ async def fetch_price_usd(session: aiohttp.ClientSession, token_addr: str) -> Op
         if not pairs:
             return None
 
+        # première paire avec un priceUsd disponible
         for p in pairs:
             price = p.get("priceUsd")
             if price is not None:
-                return _to_float(price, None)
+                return _to_float(str(price), None)
         return None
 
     return None
 
 
 async def build_message() -> str:
+    """
+    Construit le message avec prix, valeur par token et total.
+    """
     rows: List[str] = []
     total_usd = 0.0
 
@@ -110,7 +119,6 @@ async def build_message() -> str:
 
     rows.append("—" * 32)
     rows.append(f"Total (3 tokens) : {_fmt_usd(total_usd)}")
-
     return "\n".join(rows)
 
 
@@ -139,10 +147,10 @@ async def job_send_periodic(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.exception("Periodic send error: %s", e)
 
 
-# ------------------ Main ------------------
+# ------------------ Main (synchrone) ------------------
 
 
-async def main() -> None:
+def main() -> None:
     if not TELEGRAM_TOKEN or not CHAT_ID:
         raise RuntimeError("TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID manquant")
 
@@ -156,13 +164,16 @@ async def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("now", cmd_now))
 
+    # Envoi périodique toutes les 30 minutes
     app.job_queue.run_repeating(
-        job_send_periodic, interval=timedelta(minutes=SEND_INTERVAL_MIN), first=0
+        job_send_periodic,
+        interval=timedelta(minutes=SEND_INTERVAL_MIN),
+        first=0,
     )
 
     log.info("Bot started. Sending price updates every %s seconds.", SEND_INTERVAL_MIN * 60)
-    await app.run_polling(allowed_updates=None)
+    app.run_polling(allowed_updates=None)  # bloquant, pas d'async/await ici
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
